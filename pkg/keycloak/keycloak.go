@@ -2,9 +2,12 @@ package keycloak
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"reflect"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/aerogear/keycloak-operator/pkg/apis/aerogear/v1alpha1"
@@ -46,174 +49,229 @@ func NewHandler(kcClientFactory KeycloakClientFactory, svcCatalog scclientset.In
 	}
 }
 
+type adminSecret struct {
+	ADMIN_USERNAME string `json:"ADMIN_USERNAME"`
+	ADMIN_PASSWORD string `json:"ADMIN_PASSWORD"`
+}
+
 func (h *Handler) Handle(ctx context.Context, event sdk.Event) error {
 	kc := event.Object.(*v1alpha1.Keycloak)
-	kcCopy := kc.DeepCopy()
+	//kcCopy := kc.DeepCopy()
 	namespace := kc.ObjectMeta.Namespace
 
-	if kc.GetDeletionTimestamp() != nil && (kc.Status.Phase != v1alpha1.PhaseDeprovisioning && kc.Status.Phase != v1alpha1.PhaseDeprovisioned && kc.Status.Phase != v1alpha1.PhaseDeprovisionFailed) {
-		kcCopy.Status.Phase = v1alpha1.PhaseDeprovisioning
-		kcCopy.Status.Ready = false
+	// Compare amount of clients in keycloak to amount of clients
+	// defined in the keycloak resource
 
-		return sdk.Update(kcCopy)
-	}
-
-	switch kc.Status.Phase {
-	case v1alpha1.NoPhase:
-		kcCopy.Status.Phase = v1alpha1.PhaseAccepted
-		kcCopy.Status.Ready = false
-
-	case v1alpha1.PhaseAccepted:
-		if kc.Spec.AdminCredentials == "" {
-			adminPwd, err := h.generatePassword()
-			if err != nil {
-				return err
-			}
-
-			adminCredRef, err := h.createAdminCredentials(namespace, "admin", adminPwd)
-			if err != nil {
-				return err
-			}
-
-			kcCopy.Spec.AdminCredentials = adminCredRef.GetName()
-			kcCopy.Status.Phase = v1alpha1.PhaseCredentialsPending
-		}
-
-	case v1alpha1.PhaseCredentialsPending:
-		adminCreds, err := h.k8sClient.CoreV1().Secrets(namespace).Get(kc.Spec.AdminCredentials, metav1.GetOptions{})
-		if err != nil {
-			return errors.Wrap(err, "failed to get the secret for the admin credentials")
-		}
-		if adminCreds != nil {
-			kcCopy.Status.Phase = v1alpha1.PhaseCredentialsCreated
-		}
-
-	case v1alpha1.PhaseCredentialsCreated:
-		sc, err := h.getServiceClass()
-		if err != nil {
-			return err
-		}
-
-		adminCreds, err := h.k8sClient.CoreV1().Secrets(namespace).Get(kc.Spec.AdminCredentials, metav1.GetOptions{})
-		if err != nil {
-			return errors.Wrap(err, "failed to get the secret for the admin credentials")
-		}
-
-		decodedParams := map[string]string{}
-		for k, v := range adminCreds.Data {
-			decodedParams[k] = string(v)
-		}
-
-		parameters, err := json.Marshal(decodedParams)
-		if err != nil {
-			return errors.Wrap(err, "failed to marshal decoded parameters")
-		}
-
-		si := h.createServiceInstance(namespace, parameters, *sc)
-		serviceInstance, err := h.serviceCatalogClient.Servicecatalog().ServiceInstances(namespace).Create(&si)
-		if err != nil {
-			kcCopy.Status.Phase = v1alpha1.PhaseFailed
-			kcCopy.Status.Message = fmt.Sprintf("failed to create service instance: %v", err)
-
-			updateErr := sdk.Update(kcCopy)
-			if updateErr != nil {
-				return errors.Wrap(updateErr, fmt.Sprintf("failed to create service instance: %v, failed to update resource", err))
-			}
-
-			return errors.Wrap(err, "failed to create service instance")
-		}
-
-		kcCopy.Spec.InstanceID = serviceInstance.GetName()
-		kcCopy.Status.Phase = v1alpha1.PhaseProvisioning
-
-	case v1alpha1.PhaseProvisioning:
-		if kc.Spec.InstanceID == "" {
-			kcCopy.Status.Phase = v1alpha1.PhaseFailed
-			kcCopy.Status.Message = "instance ID is not defined"
-
-			err := sdk.Update(kcCopy)
-			if err != nil {
-				return errors.Wrap(err, "instance ID is not defined, failed to update resource")
-			}
-
-			return errors.New("instance ID is not defined")
-		} else {
-			si, err := h.serviceCatalogClient.Servicecatalog().ServiceInstances(namespace).Get(kc.Spec.InstanceID, metav1.GetOptions{})
-			if err != nil {
-				return errors.Wrap(err, "failed to get service instance")
-			}
-
-			if len(si.Status.Conditions) == 0 {
-				return nil
-			}
-
-			siCondition := si.Status.Conditions[0]
-			if siCondition.Type == "Ready" && siCondition.Status == "True" {
-				kcCopy.Status.Phase = v1alpha1.PhaseComplete
-				kcCopy.Status.Ready = true
-			}
-		}
-
-	case v1alpha1.PhaseDeprovisioning:
-		err := h.deleteKeycloak(kcCopy)
-		if err != nil {
-			kcCopy.Status.Phase = v1alpha1.PhaseDeprovisionFailed
-			kcCopy.Status.Message = fmt.Sprintf("failed to deprovision: %v", err)
-
-			updateErr := sdk.Update(kcCopy)
-			if updateErr != nil {
-				return errors.Wrap(updateErr, fmt.Sprintf("failed to deprovision instance: %v, failed to update resource", err))
-			}
-
-			return errors.Wrap(err, "failed to deprovision")
-		}
-
-		kcCopy.Status.Phase = v1alpha1.PhaseDeprovisioned
-
-	case v1alpha1.PhaseDeprovisioned:
-		kcCopy.Finalizers = []string{}
-	}
-
-	// Only update the Keycloak custom resource if there was a change
-	if !reflect.DeepEqual(kc, kcCopy) {
-		if err := sdk.Update(kcCopy); err != nil {
-			return errors.Wrap(err, "failed to update the keycloak resource")
-		}
-	}
-
-	// set up authenticated client
-	authenticatedClient, err := h.kcClientFactory.AuthenticatedClient(*kcCopy)
+	// Authenticate to keycloak, first get the secret in the keycloak object
+	secret, err := h.k8sClient.CoreV1().Secrets(namespace).Get(kc.Spec.AdminCredentials, metav1.GetOptions{})
 	if err != nil {
-		return errors.Wrap(err, "failed to get authenticated client for keycloak")
+		errors.Wrap(err, "error getting admin creds secret")
 	}
-	// hand of each realm to reconcile realm may want to make async to avoid blocking
-	for _, r := range kcCopy.Spec.Realms {
-		if err := h.reconcileRealm(ctx, r, authenticatedClient); err != nil {
-			return errors.Wrap(err, "failed to reconcile realm "+r.Name)
+
+	params := map[string]string{}
+	for k, v := range secret.Data {
+		params[k] = string(v)
+	}
+
+	adminCreds := &adminSecret{
+		ADMIN_USERNAME: params["ADMIN_USERNAME"],
+		ADMIN_PASSWORD: params["ADMIN_PASSWORD"],
+	}
+
+	// Get the auth token
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	resp, err := http.PostForm("https://keycloak-c2186c-test1.10.32.241.59.nip.io/auth/realms/admin/protocol/openid-connect/token",
+		url.Values{
+			"client_id":  {"admin-cli"},
+			"username":   {adminCreds.ADMIN_USERNAME},
+			"password":   {adminCreds.ADMIN_PASSWORD},
+			"grant_type": {"password"},
+		})
+
+	logrus.Info(resp)
+
+	// For each realm, get its corresponding clients
+	for _, realm := range kc.Spec.Realms {
+		logrus.Info("Realm:", realm)
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		resp, err := http.Get(fmt.Sprintf("https://keycloak-c2186c-test1.10.32.241.59.nip.io/auth/admin/realms/%s/clients", realm.Name))
+		if err != nil {
+			return nil
 		}
-	}
+		defer resp.Body.Close()
+		body, err := ioutil.ReadAll(resp.Body)
 
-	if event.Deleted {
-		return nil
-	}
+		logrus.Info("body:", string(body))
+		// for client := range clients {
+		// 	h.reconcileClient()
+		// }
 
-	if kcCopy.GetDeletionTimestamp() != nil {
-		return h.finalizeKeycloak(kcCopy)
-	}
-
-	if kc.Status.Phase == v1alpha1.PhaseAccepted {
-		logrus.Info("not doing anything as this resource is already being worked on")
-		return nil
-	}
-
-	// Only update the Keycloak custom resource if there was a change
-	if !reflect.DeepEqual(kc, kcCopy) {
-		if err := sdk.Update(kcCopy); err != nil {
-			return errors.Wrap(err, "failed to update the keycloak resource")
-		}
 	}
 
 	return nil
+	// if kc.GetDeletionTimestamp() != nil && (kc.Status.Phase != v1alpha1.PhaseDeprovisioning && kc.Status.Phase != v1alpha1.PhaseDeprovisioned && kc.Status.Phase != v1alpha1.PhaseDeprovisionFailed) {
+	// 	kcCopy.Status.Phase = v1alpha1.PhaseDeprovisioning
+	// 	kcCopy.Status.Ready = false
+
+	// 	return sdk.Update(kcCopy)
+	// }
+
+	// switch kc.Status.Phase {
+	// case v1alpha1.NoPhase:
+	// 	kcCopy.Status.Phase = v1alpha1.PhaseAccepted
+	// 	kcCopy.Status.Ready = false
+
+	// case v1alpha1.PhaseAccepted:
+	// 	if kc.Spec.AdminCredentials == "" {
+	// 		adminPwd, err := h.generatePassword()
+	// 		if err != nil {
+	// 			return err
+	// 		}
+
+	// 		adminCredRef, err := h.createAdminCredentials(namespace, "admin", adminPwd)
+	// 		if err != nil {
+	// 			return err
+	// 		}
+
+	// 		kcCopy.Spec.AdminCredentials = adminCredRef.GetName()
+	// 		kcCopy.Status.Phase = v1alpha1.PhaseCredentialsPending
+	// 	}
+
+	// case v1alpha1.PhaseCredentialsPending:
+	// 	adminCreds, err := h.k8sClient.CoreV1().Secrets(namespace).Get(kc.Spec.AdminCredentials, metav1.GetOptions{})
+	// 	if err != nil {
+	// 		return errors.Wrap(err, "failed to get the secret for the admin credentials")
+	// 	}
+	// 	if adminCreds != nil {
+	// 		kcCopy.Status.Phase = v1alpha1.PhaseCredentialsCreated
+	// 	}
+
+	// case v1alpha1.PhaseCredentialsCreated:
+	// 	sc, err := h.getServiceClass()
+	// 	if err != nil {
+	// 		return err
+	// 	}
+
+	// 	adminCreds, err := h.k8sClient.CoreV1().Secrets(namespace).Get(kc.Spec.AdminCredentials, metav1.GetOptions{})
+	// 	if err != nil {
+	// 		return errors.Wrap(err, "failed to get the secret for the admin credentials")
+	// 	}
+
+	// 	decodedParams := map[string]string{}
+	// 	for k, v := range adminCreds.Data {
+	// 		decodedParams[k] = string(v)
+	// 	}
+
+	// 	parameters, err := json.Marshal(decodedParams)
+	// 	if err != nil {
+	// 		return errors.Wrap(err, "failed to marshal decoded parameters")
+	// 	}
+
+	// 	si := h.createServiceInstance(namespace, parameters, *sc)
+	// 	serviceInstance, err := h.serviceCatalogClient.Servicecatalog().ServiceInstances(namespace).Create(&si)
+	// 	if err != nil {
+	// 		kcCopy.Status.Phase = v1alpha1.PhaseFailed
+	// 		kcCopy.Status.Message = fmt.Sprintf("failed to create service instance: %v", err)
+
+	// 		updateErr := sdk.Update(kcCopy)
+	// 		if updateErr != nil {
+	// 			return errors.Wrap(updateErr, fmt.Sprintf("failed to create service instance: %v, failed to update resource", err))
+	// 		}
+
+	// 		return errors.Wrap(err, "failed to create service instance")
+	// 	}
+
+	// 	kcCopy.Spec.InstanceID = serviceInstance.GetName()
+	// 	kcCopy.Status.Phase = v1alpha1.PhaseProvisioning
+
+	// case v1alpha1.PhaseProvisioning:
+	// 	if kc.Spec.InstanceID == "" {
+	// 		kcCopy.Status.Phase = v1alpha1.PhaseFailed
+	// 		kcCopy.Status.Message = "instance ID is not defined"
+
+	// 		err := sdk.Update(kcCopy)
+	// 		if err != nil {
+	// 			return errors.Wrap(err, "instance ID is not defined, failed to update resource")
+	// 		}
+
+	// 		return errors.New("instance ID is not defined")
+	// 	} else {
+	// 		si, err := h.serviceCatalogClient.Servicecatalog().ServiceInstances(namespace).Get(kc.Spec.InstanceID, metav1.GetOptions{})
+	// 		if err != nil {
+	// 			return errors.Wrap(err, "failed to get service instance")
+	// 		}
+
+	// 		if len(si.Status.Conditions) == 0 {
+	// 			return nil
+	// 		}
+
+	// 		siCondition := si.Status.Conditions[0]
+	// 		if siCondition.Type == "Ready" && siCondition.Status == "True" {
+	// 			kcCopy.Status.Phase = v1alpha1.PhaseComplete
+	// 			kcCopy.Status.Ready = true
+	// 		}
+	// 	}
+
+	// case v1alpha1.PhaseDeprovisioning:
+	// 	err := h.deleteKeycloak(kcCopy)
+	// 	if err != nil {
+	// 		kcCopy.Status.Phase = v1alpha1.PhaseDeprovisionFailed
+	// 		kcCopy.Status.Message = fmt.Sprintf("failed to deprovision: %v", err)
+
+	// 		updateErr := sdk.Update(kcCopy)
+	// 		if updateErr != nil {
+	// 			return errors.Wrap(updateErr, fmt.Sprintf("failed to deprovision instance: %v, failed to update resource", err))
+	// 		}
+
+	// 		return errors.Wrap(err, "failed to deprovision")
+	// 	}
+
+	// 	kcCopy.Status.Phase = v1alpha1.PhaseDeprovisioned
+
+	// case v1alpha1.PhaseDeprovisioned:
+	// 	kcCopy.Finalizers = []string{}
+	// }
+
+	// // Only update the Keycloak custom resource if there was a change
+	// if !reflect.DeepEqual(kc, kcCopy) {
+	// 	if err := sdk.Update(kcCopy); err != nil {
+	// 		return errors.Wrap(err, "failed to update the keycloak resource")
+	// 	}
+	// }
+
+	// // set up authenticated client
+	// authenticatedClient, err := h.kcClientFactory.AuthenticatedClient(*kcCopy)
+	// if err != nil {
+	// 	return errors.Wrap(err, "failed to get authenticated client for keycloak")
+	// }
+	// // hand of each realm to reconcile realm may want to make async to avoid blocking
+	// for _, r := range kcCopy.Spec.Realms {
+	// 	if err := h.reconcileRealm(ctx, r, authenticatedClient); err != nil {
+	// 		return errors.Wrap(err, "failed to reconcile realm "+r.Name)
+	// 	}
+	// }
+
+	// if event.Deleted {
+	// 	return nil
+	// }
+
+	// if kcCopy.GetDeletionTimestamp() != nil {
+	// 	return h.finalizeKeycloak(kcCopy)
+	// }
+
+	// if kc.Status.Phase == v1alpha1.PhaseAccepted {
+	// 	logrus.Info("not doing anything as this resource is already being worked on")
+	// 	return nil
+	// }
+
+	// // Only update the Keycloak custom resource if there was a change
+	// if !reflect.DeepEqual(kc, kcCopy) {
+	// 	if err := sdk.Update(kcCopy); err != nil {
+	// 		return errors.Wrap(err, "failed to update the keycloak resource")
+	// 	}
+	// }
+
+	// return nil
 }
 
 func (h *Handler) getServiceClass() (*v1beta1.ClusterServiceClass, error) {
